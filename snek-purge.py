@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Snek-Purge - Limpia tu sistema como un profesional.
+🐍 Snek-Purge v2.0 - Limpieza profesional para Windows y Linux
 Herramienta CLI para limpiar archivos innecesarios, liberar memoria y optimizar el rendimiento.
-Compatible con Windows y Linux.
 """
 
 import os
@@ -15,20 +14,25 @@ import subprocess
 import argparse
 import time
 import json
-from datetime import datetime
+import glob
+import hashlib
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import List, Tuple, Dict, Optional
 
 try:
     import psutil
     from tqdm import tqdm
-    from colorama import init, Fore, Style
+    from colorama import init, Fore, Back, Style
     init(autoreset=True)
 except ImportError as e:
-    print(f"Error: Faltan dependencias. Instálalas con: pip install psutil tqdm colorama")
+    print(f"❌ Error: Faltan dependencias. Instálalas con:")
+    print(f"   pip install psutil tqdm colorama")
     print(f"Detalle: {e}")
     sys.exit(1)
 
-# ==================== CONFIGURACIÓN ====================
+# ==================== CONFIGURACIÓN GLOBAL ====================
 CONFIG = {
     "dry_run": False,
     "verbose": False,
@@ -40,458 +44,836 @@ CONFIG = {
     "logs": False,
     "orphans": False,
     "docker": False,
+    "safe_mode": True,
+    "backup": False,
+    "parallel": True,
+    "max_workers": 4
 }
 
-ESPACIO_LIBERADO = 0
-ARCHIVOS_ELIMINADOS = 0
+STATS = {
+    "files_deleted": 0,
+    "space_freed": 0,
+    "errors": 0,
+    "warnings": 0,
+    "start_time": None,
+    "end_time": None
+}
+
 SISTEMA = platform.system()
+USUARIO = os.getenv("USER") or os.getenv("USERNAME") or "usuario"
+HOME = os.path.expanduser("~")
 
-# ==================== UTILIDADES ====================
-def print_colored(text, color=Fore.WHITE, style=Style.NORMAL):
-    """Imprime texto con color."""
-    print(f"{style}{color}{text}{Style.RESET_ALL}")
+# ==================== UTILIDADES AVANZADAS ====================
+class Spinner:
+    """Animación de carga en consola."""
+    def __init__(self, message="Procesando..."):
+        self.message = message
+        self.running = False
+        self.spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        self.thread = None
+    
+    def spin(self):
+        while self.running:
+            for char in self.spinner_chars:
+                if not self.running:
+                    break
+                print(f"\r{Fore.CYAN}{char} {self.message}{Style.RESET_ALL}", end="", flush=True)
+                time.sleep(0.1)
+        print("\r" + " " * (len(self.message) + 10), end="", flush=True)
+        print("\r", end="", flush=True)
+    
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self.spin)
+        self.thread.daemon = True
+        self.thread.start()
+    
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=0.5)
 
-def print_progress(description, iterable, **kwargs):
-    """Barra de progreso con tqdm."""
-    return tqdm(iterable, desc=description, unit="archivos", **kwargs)
+def print_header(text, color=Fore.CYAN, style=Style.BRIGHT):
+    """Imprime un encabezado estilizado."""
+    print(f"\n{style}{color}┌{'─' * 60}┐")
+    print(f"{style}{color}│ {text.center(58)} │")
+    print(f"{style}{color}└{'─' * 60}┘{Style.RESET_ALL}")
 
-def get_size(path):
-    """Obtiene el tamaño de un archivo o directorio."""
+def print_success(text):
+    print(f"{Fore.GREEN}✅ {text}{Style.RESET_ALL}")
+
+def print_warning(text):
+    STATS["warnings"] += 1
+    print(f"{Fore.YELLOW}⚠️  {text}{Style.RESET_ALL}")
+
+def print_error(text):
+    STATS["errors"] += 1
+    print(f"{Fore.RED}❌ {text}{Style.RESET_ALL}")
+
+def print_info(text):
+    print(f"{Fore.BLUE}ℹ️  {text}{Style.RESET_ALL}")
+
+def format_size(bytes_size: int) -> str:
+    """Formatea bytes a una unidad legible."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_size < 1024.0:
+            return f"{bytes_size:.2f} {unit}"
+        bytes_size /= 1024.0
+    return f"{bytes_size:.2f} PB"
+
+def get_size(path: str) -> int:
+    """Obtiene el tamaño de un archivo o directorio de forma eficiente."""
     try:
         if os.path.isfile(path):
             return os.path.getsize(path)
         elif os.path.isdir(path):
             total = 0
-            for dirpath, dirnames, filenames in os.walk(path):
-                for f in filenames:
-                    fp = os.path.join(dirpath, f)
-                    if os.path.exists(fp):
-                        total += os.path.getsize(fp)
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            total += entry.stat().st_size
+                        elif entry.is_dir(follow_symlinks=False):
+                            total += get_size(entry.path)
+                    except (PermissionError, OSError):
+                        pass
             return total
-    except (PermissionError, OSError):
-        return 0
+    except (PermissionError, OSError, FileNotFoundError):
+        pass
     return 0
 
-def format_size(bytes):
-    """Formatea bytes a una unidad legible."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes < 1024.0:
-            return f"{bytes:.2f} {unit}"
-        bytes /= 1024.0
-    return f"{bytes:.2f} PB"
-
-def run_command(command, shell=True):
-    """Ejecuta un comando del sistema y retorna la salida."""
+def run_command(cmd: str, sudo: bool = False, timeout: int = 300) -> Tuple[str, str, int]:
+    """Ejecuta un comando del sistema de forma segura."""
+    if sudo and SISTEMA == "Linux" and os.geteuid() != 0:
+        cmd = f"sudo {cmd}"
+    
     try:
-        result = subprocess.run(command, shell=shell, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=timeout, check=False
+        )
         return result.stdout.strip(), result.stderr.strip(), result.returncode
+    except subprocess.TimeoutExpired:
+        return "", f"Timeout después de {timeout}s", -1
     except Exception as e:
-        if CONFIG["verbose"]:
-            print_colored(f"Error ejecutando comando: {e}", Fore.RED)
-        return "", str(e), 1
+        return "", str(e), -1
 
-def confirm_action(message="¿Continuar?"):
-    """Solicita confirmación al usuario."""
+def confirm_action(message: str = "¿Continuar?", default: bool = False) -> bool:
+    """Solicita confirmación al usuario con opción por defecto."""
     if CONFIG["scheduled"] or CONFIG["dry_run"]:
         return True
-    response = input(f"{Fore.YELLOW}{message} (s/N): {Style.RESET_ALL}").lower()
-    return response in ['s', 'si', 'y', 'yes']
+    
+    default_text = "S/n" if default else "s/N"
+    response = input(f"{Fore.YELLOW}{message} ({default_text}): {Style.RESET_ALL}").strip().lower()
+    
+    if not response:
+        return default
+    
+    return response in ['s', 'si', 'y', 'yes', 'sí']
 
-# ==================== FUNCIONES DE LIMPIEZA ====================
+def backup_file(file_path: str) -> bool:
+    """Crea un backup de un archivo antes de eliminarlo."""
+    if not CONFIG["backup"]:
+        return True
+    
+    try:
+        backup_dir = Path(HOME) / ".snek-purge-backup"
+        backup_dir.mkdir(exist_ok=True)
+        
+        if os.path.exists(file_path):
+            backup_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{Path(file_path).name}"
+            backup_path = backup_dir / backup_name
+            shutil.copy2(file_path, backup_path)
+            if CONFIG["verbose"]:
+                print_info(f"Backup creado: {backup_path}")
+        return True
+    except Exception as e:
+        print_warning(f"No se pudo crear backup de {file_path}: {e}")
+        return False
+
+# ==================== FUNCIONES DE LIMPIEZA PRINCIPALES ====================
 def clean_temp_files():
-    """Elimina archivos temporales del sistema."""
-    global ESPACIO_LIBERADO, ARCHIVOS_ELIMINADOS
-    print_colored("\n🧹 Limpiando archivos temporales...", Fore.CYAN, Style.BRIGHT)
+    """Elimina archivos temporales del sistema de manera más eficiente."""
+    print_header("🧹 LIMPIANDO ARCHIVOS TEMPORALES", Fore.CYAN)
+    spinner = Spinner("Escaneando archivos temporales...")
+    spinner.start()
     
     temp_dirs = []
     if SISTEMA == "Windows":
-        temp_dirs = [os.environ.get('TEMP', ''), os.environ.get('TMP', ''), 'C:\\Windows\\Temp']
-    else:  # Linux y otros
-        temp_dirs = ['/tmp', '/var/tmp']
+        temp_dirs = [
+            os.environ.get('TEMP', ''),
+            os.environ.get('TMP', ''),
+            'C:\\Windows\\Temp',
+            os.path.join(HOME, 'AppData', 'Local', 'Temp')
+        ]
+    else:
+        temp_dirs = ['/tmp', '/var/tmp', os.path.join(HOME, '.cache')]
     
     temp_dirs = [d for d in temp_dirs if d and os.path.exists(d)]
+    total_size = 0
+    files_count = 0
     
     for temp_dir in temp_dirs:
-        if not os.path.exists(temp_dir):
-            continue
         try:
-            files = os.listdir(temp_dir)
-            for file in print_progress(f"  Limpiando {temp_dir}", files):
-                file_path = os.path.join(temp_dir, file)
+            items = list(Path(temp_dir).glob('*'))
+            for item in items:
                 try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        size = get_size(file_path)
+                    size = get_size(str(item))
+                    if size > 0:
+                        total_size += size
+                        files_count += 1
+                        
                         if not CONFIG["dry_run"]:
-                            os.unlink(file_path)
-                        ESPACIO_LIBERADO += size
-                        ARCHIVOS_ELIMINADOS += 1
-                    elif os.path.isdir(file_path):
-                        size = get_size(file_path)
-                        if not CONFIG["dry_run"]:
-                            shutil.rmtree(file_path, ignore_errors=True)
-                        ESPACIO_LIBERADO += size
-                        ARCHIVOS_ELIMINADOS += 1
-                except (PermissionError, OSError):
+                            if item.is_file():
+                                if backup_file(str(item)):
+                                    item.unlink()
+                            elif item.is_dir():
+                                shutil.rmtree(str(item), ignore_errors=True)
+                except Exception:
                     pass
-        except (PermissionError, OSError):
-            print_colored(f"  Sin permisos para acceder a: {temp_dir}", Fore.YELLOW)
+        except Exception:
+            pass
+    
+    spinner.stop()
+    
+    if CONFIG["dry_run"]:
+        print_success(f"Se limpiarían {files_count} archivos temporales ({format_size(total_size)})")
+    else:
+        print_success(f"Eliminados {files_count} archivos temporales ({format_size(total_size)})")
+        STATS["files_deleted"] += files_count
+        STATS["space_freed"] += total_size
 
-def clean_cache():
+def clean_system_cache():
     """Limpia cachés de gestores de paquetes y sistema."""
-    global ESPACIO_LIBERADO, ARCHIVOS_ELIMINADOS
-    print_colored("\n📦 Limpiando cachés del sistema...", Fore.CYAN, Style.BRIGHT)
+    print_header("📦 LIMPIANDO CACHÉS DEL SISTEMA", Fore.CYAN)
     
     if SISTEMA == "Linux":
-        cache_managers = [
-            ("apt", "sudo apt-get clean", "/var/cache/apt/archives"),
-            ("pacman", "sudo pacman -Scc --noconfirm", "/var/cache/pacman/pkg"),
-            ("dnf", "sudo dnf clean all", "/var/cache/dnf"),
-            ("yum", "sudo yum clean all", "/var/cache/yum"),
-            ("pip", "pip cache purge", "~/.cache/pip"),
-            ("npm", "npm cache clean --force", "~/.npm"),
+        managers = [
+            ("APT", "sudo apt-get clean", "sudo apt-get autoclean"),
+            ("Pacman", "sudo pacman -Scc --noconfirm", ""),
+            ("DNF", "sudo dnf clean all", ""),
+            ("YUM", "sudo yum clean all", ""),
+            ("Flatpak", "flatpak uninstall --unused", ""),
+            ("Snap", "sudo snap remove --purge", ""),
+            ("Pip", "pip cache purge", ""),
+            ("NPM", "npm cache clean --force", ""),
+            ("Cargo", "cargo clean", ""),
+            ("Gem", "gem cleanup", "")
         ]
-        for name, cmd, path in cache_managers:
+        
+        for name, cmd1, cmd2 in managers:
             try:
-                if CONFIG["dry_run"]:
-                    size = get_size(os.path.expanduser(path)) if os.path.exists(os.path.expanduser(path)) else 0
-                    ESPACIO_LIBERADO += size
-                    print_colored(f"  [DRY-RUN] {name}: {format_size(size)} a liberar", Fore.YELLOW)
+                if shutil.which(cmd1.split()[0]):
+                    if CONFIG["dry_run"]:
+                        print_info(f"[DRY-RUN] {name}: se limpiará caché")
+                    else:
+                        stdout, stderr, code = run_command(cmd1)
+                        if code == 0:
+                            print_success(f"{name} limpio correctamente")
+                        else:
+                            print_warning(f"{name} no disponible o error: {stderr}")
+                        
+                        if cmd2 and shutil.which(cmd2.split()[0]):
+                            stdout, stderr, code = run_command(cmd2)
+                            if code == 0:
+                                print_success(f"{name} autoclean completado")
                 else:
+                    if CONFIG["verbose"]:
+                        print_info(f"{name} no instalado")
+            except Exception as e:
+                if CONFIG["verbose"]:
+                    print_warning(f"Error en {name}: {e}")
+    
+    # Caché común de usuario
+    user_cache = Path(HOME) / '.cache'
+    if user_cache.exists():
+        size = get_size(str(user_cache))
+        if size > 0:
+            if CONFIG["dry_run"]:
+                print_info(f"[DRY-RUN] Caché de usuario: {format_size(size)} a liberar")
+            else:
+                try:
+                    shutil.rmtree(user_cache, ignore_errors=True)
+                    user_cache.mkdir(exist_ok=True)
+                    print_success(f"Caché de usuario limpiado ({format_size(size)})")
+                    STATS["space_freed"] += size
+                except Exception as e:
+                    print_warning(f"No se pudo limpiar caché de usuario: {e}")
+
+def clean_memory_advanced():
+    """Libera memoria RAM, swap y optimiza el sistema."""
+    print_header("💾 OPTIMIZANDO MEMORIA", Fore.CYAN)
+    
+    if SISTEMA == "Linux":
+        # Mostrar estado actual
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        print_info(f"Memoria: {format_size(mem.used)} usado / {format_size(mem.total)} total ({(mem.percent):.1f}%)")
+        if swap.total > 0:
+            print_info(f"Swap: {format_size(swap.used)} usado / {format_size(swap.total)} total ({(swap.percent):.1f}%)")
+        
+        if not CONFIG["dry_run"] and confirm_action("¿Liberar memoria RAM y swap?"):
+            commands = [
+                ("Sincronizando sistema", "sync"),
+                ("Liberando caché de páginas", "echo 3 | sudo tee /proc/sys/vm/drop_caches"),
+                ("Liberando swap", "sudo swapoff -a && sudo swapon -a"),
+                ("Liberando memoria no utilizada", "echo 1 | sudo tee /proc/sys/vm/compact_memory")
+            ]
+            
+            for desc, cmd in commands:
+                try:
                     stdout, stderr, code = run_command(cmd)
                     if code == 0:
-                        print_colored(f"  ✅ {name} limpio", Fore.GREEN)
+                        print_success(f"{desc} completado")
                     else:
-                        print_colored(f"  ⚠️ {name} no disponible o error", Fore.YELLOW)
-            except Exception:
-                pass
-    
-    # Caché de usuario común
-    user_cache = os.path.expanduser("~/.cache")
-    if os.path.exists(user_cache):
-        size = get_size(user_cache)
-        if not CONFIG["dry_run"]:
-            try:
-                shutil.rmtree(user_cache, ignore_errors=True)
-                os.makedirs(user_cache, exist_ok=True)
-            except:
-                pass
-        ESPACIO_LIBERADO += size
-        print_colored(f"  ✅ Caché de usuario: {format_size(size)}", Fore.GREEN)
-
-def clean_memory():
-    """Libera memoria RAM y swap."""
-    global ESPACIO_LIBERADO
-    print_colored("\n💾 Liberando memoria...", Fore.CYAN, Style.BRIGHT)
-    
-    if SISTEMA == "Linux":
-        try:
-            # Sincronizar y liberar cachés
-            if not CONFIG["dry_run"]:
-                run_command("sync")
-                run_command("echo 3 | sudo tee /proc/sys/vm/drop_caches")
-                run_command("sudo swapoff -a && sudo swapon -a")
-                print_colored("  ✅ Memoria RAM y swap liberados", Fore.GREEN)
+                        print_warning(f"{desc} falló: {stderr}")
+                except Exception as e:
+                    print_error(f"Error en {desc}: {e}")
+            
+            # Mostrar estado después
+            time.sleep(1)
+            mem2 = psutil.virtual_memory()
+            freed = mem.used - mem2.used
+            if freed > 0:
+                print_success(f"Memoria liberada: {format_size(freed)}")
+                STATS["space_freed"] += freed
             else:
-                print_colored("  [DRY-RUN] Memoria y swap serán liberados", Fore.YELLOW)
-        except Exception:
-            print_colored("  ⚠️ No se pudo liberar memoria (requiere sudo)", Fore.YELLOW)
+                print_info("No se pudo liberar memoria significativa")
+    
     elif SISTEMA == "Windows":
-        try:
-            if not CONFIG["dry_run"]:
-                run_command("powershell -command Clear-RecycleBin -Force")
-                run_command("powershell -command & {[System.GC]::Collect()}")
-                print_colored("  ✅ Memoria y papelera limpiada", Fore.GREEN)
-            else:
-                print_colored("  [DRY-RUN] Memoria y papelera serán limpiadas", Fore.YELLOW)
-        except Exception:
-            print_colored("  ⚠️ Error en limpieza de memoria", Fore.YELLOW)
-
-def clean_browsers():
-    """Limpia caché de navegadores."""
-    global ESPACIO_LIBERADO, ARCHIVOS_ELIMINADOS
-    print_colored("\n🌐 Limpiando caché de navegadores...", Fore.CYAN, Style.BRIGHT)
+        print_info("Liberando memoria en Windows...")
+        if not CONFIG["dry_run"]:
+            commands = [
+                ("Limpiando papelera", "powershell -command Clear-RecycleBin -Force"),
+                ("Liberando memoria", "powershell -command & {[System.GC]::Collect()}")
+            ]
+            for desc, cmd in commands:
+                stdout, stderr, code = run_command(cmd)
+                if code == 0:
+                    print_success(f"{desc} completado")
+                else:
+                    print_warning(f"{desc} falló")
     
-    browser_paths = {
-        "Chrome": [
-            os.path.expanduser("~/.cache/google-chrome"),
-            os.path.expanduser("~/.config/google-chrome/Default/Cache"),
-            os.path.expanduser("~/AppData/Local/Google/Chrome/User Data/Default/Cache")
-        ],
-        "Firefox": [
-            os.path.expanduser("~/.cache/mozilla/firefox"),
-            os.path.expanduser("~/.mozilla/firefox/*.default/cache2"),
-            os.path.expanduser("~/AppData/Local/Mozilla/Firefox/Profiles/*.default/cache2")
-        ],
-        "Edge": [
-            os.path.expanduser("~/.cache/microsoft-edge"),
-            os.path.expanduser("~/AppData/Local/Microsoft/Edge/User Data/Default/Cache")
-        ],
-        "Opera": [
-            os.path.expanduser("~/.cache/opera"),
-            os.path.expanduser("~/AppData/Local/Opera Software/Opera Stable/Cache")
-        ]
+    # Mostrar estado final
+    if not CONFIG["dry_run"]:
+        time.sleep(0.5)
+        mem_final = psutil.virtual_memory()
+        print_info(f"Memoria final: {format_size(mem_final.used)} usado / {format_size(mem_final.total)} total")
+
+def clean_browsers_advanced():
+    """Limpia caché de navegadores web de manera exhaustiva."""
+    print_header("🌐 LIMPIANDO NAVEGADORES", Fore.CYAN)
+    
+    browsers_config = {
+        "Google Chrome": {
+            "linux": ["~/.cache/google-chrome", "~/.config/google-chrome/Default/Cache"],
+            "windows": ["%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Cache"]
+        },
+        "Mozilla Firefox": {
+            "linux": ["~/.cache/mozilla/firefox", "~/.mozilla/firefox/*.default/cache2"],
+            "windows": ["%APPDATA%\\Mozilla\\Firefox\\Profiles\\*.default\\cache2"]
+        },
+        "Microsoft Edge": {
+            "linux": ["~/.cache/microsoft-edge"],
+            "windows": ["%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default\\Cache"]
+        },
+        "Opera": {
+            "linux": ["~/.cache/opera"],
+            "windows": ["%LOCALAPPDATA%\\Opera Software\\Opera Stable\\Cache"]
+        },
+        "Brave": {
+            "linux": ["~/.cache/BraveSoftware", "~/.config/BraveSoftware/Brave-Browser/Default/Cache"],
+            "windows": ["%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Cache"]
+        },
+        "Vivaldi": {
+            "linux": ["~/.cache/vivaldi", "~/.config/vivaldi/Default/Cache"],
+            "windows": ["%LOCALAPPDATA%\\Vivaldi\\User Data\\Default\\Cache"]
+        }
     }
     
-    for browser, paths in browser_paths.items():
-        for path_pattern in paths:
-            import glob
-            for cache_path in glob.glob(path_pattern):
+    total_freed = 0
+    found_browsers = 0
+    
+    for browser, paths in browsers_config.items():
+        browser_cleaned = False
+        path_list = paths.get("linux" if SISTEMA == "Linux" else "windows", [])
+        
+        for path_pattern in path_list:
+            expanded = os.path.expandvars(os.path.expanduser(path_pattern))
+            for cache_path in glob.glob(expanded):
                 if os.path.exists(cache_path):
                     size = get_size(cache_path)
-                    if not CONFIG["dry_run"]:
-                        try:
-                            shutil.rmtree(cache_path, ignore_errors=True)
-                            print_colored(f"  ✅ {browser}: {format_size(size)} liberado", Fore.GREEN)
-                        except:
-                            print_colored(f"  ⚠️ No se pudo limpiar {browser}", Fore.YELLOW)
-                    else:
-                        print_colored(f"  [DRY-RUN] {browser}: {format_size(size)} a liberar", Fore.YELLOW)
-                    ESPACIO_LIBERADO += size
-
-def clean_orphans():
-    """Elimina paquetes huérfanos y obsoletos (Linux)."""
-    print_colored("\n📦 Eliminando paquetes huérfanos...", Fore.CYAN, Style.BRIGHT)
-    
-    if SISTEMA == "Linux":
-        if CONFIG["dry_run"]:
-            print_colored("  [DRY-RUN] Paquetes huérfanos serán eliminados", Fore.YELLOW)
-            return
+                    if size > 0:
+                        total_freed += size
+                        found_browsers += 1 if not browser_cleaned else 0
+                        browser_cleaned = True
+                        
+                        if CONFIG["dry_run"]:
+                            print_info(f"[DRY-RUN] {browser}: {format_size(size)} a limpiar")
+                        else:
+                            try:
+                                shutil.rmtree(cache_path, ignore_errors=True)
+                                print_success(f"{browser}: limpiado {format_size(size)}")
+                                STATS["space_freed"] += size
+                            except Exception as e:
+                                if CONFIG["verbose"]:
+                                    print_warning(f"Error limpiando {browser}: {e}")
         
-        # Detectar gestor de paquetes
-        if shutil.which("apt-get"):
-            cmd = "sudo apt-get autoremove -y && sudo apt-get autoclean -y"
-            stdout, stderr, code = run_command(cmd)
-            if code == 0:
-                print_colored("  ✅ Paquetes huérfanos eliminados (apt)", Fore.GREEN)
-            else:
-                print_colored("  ⚠️ Error eliminando paquetes huérfanos (apt)", Fore.YELLOW)
-        elif shutil.which("pacman"):
-            cmd = "sudo pacman -Rns $(pacman -Qdtq) --noconfirm"
-            stdout, stderr, code = run_command(cmd)
-            if code == 0:
-                print_colored("  ✅ Paquetes huérfanos eliminados (pacman)", Fore.GREEN)
-            else:
-                print_colored("  ⚠️ Error eliminando paquetes huérfanos (pacman)", Fore.YELLOW)
-        elif shutil.which("dnf"):
-            cmd = "sudo dnf autoremove -y"
-            stdout, stderr, code = run_command(cmd)
-            if code == 0:
-                print_colored("  ✅ Paquetes huérfanos eliminados (dnf)", Fore.GREEN)
-            else:
-                print_colored("  ⚠️ Error eliminando paquetes huérfanos (dnf)", Fore.YELLOW)
+        if not browser_cleaned and CONFIG["verbose"]:
+            print_info(f"{browser}: no se encontró caché")
+    
+    if CONFIG["dry_run"]:
+        print_success(f"Se limpiarían {format_size(total_freed)} de caché de navegadores")
+    else:
+        if found_browsers > 0:
+            print_success(f"Limpiados {found_browsers} navegadores ({format_size(total_freed)})")
+        else:
+            print_info("No se encontraron cachés de navegadores para limpiar")
 
-def clean_logs():
-    """Limpia logs antiguos del sistema."""
-    global ESPACIO_LIBERADO, ARCHIVOS_ELIMINADOS
-    print_colored("\n📋 Limpiando logs antiguos...", Fore.CYAN, Style.BRIGHT)
+def clean_orphans_advanced():
+    """Elimina paquetes huérfanos y dependencias no utilizadas."""
+    print_header("📦 ELIMINANDO PAQUETES HUÉRFANOS", Fore.CYAN)
+    
+    if SISTEMA != "Linux":
+        print_info("Esta función solo está disponible en Linux")
+        return
+    
+    orphan_commands = {
+        "APT": "sudo apt-get autoremove -y && sudo apt-get autoclean -y",
+        "PACMAN": "sudo pacman -Rns $(pacman -Qdtq) --noconfirm 2>/dev/null || true",
+        "DNF": "sudo dnf autoremove -y",
+        "YUM": "sudo yum autoremove -y",
+        "ZYPPER": "sudo zypper rm -u",
+        "PORTAGE": "sudo emerge --depclean",
+        "PIP": "pip list --outdated --format=freeze | grep -v '^\\-e' | cut -d = -f 1 | xargs -n1 pip install -U 2>/dev/null || true"
+    }
+    
+    if CONFIG["dry_run"]:
+        print_info("[DRY-RUN] Se eliminarían paquetes huérfanos")
+        # Simular búsqueda de paquetes
+        for manager, cmd in orphan_commands.items():
+            if shutil.which(cmd.split()[0] if not cmd.startswith('sudo') else cmd.split()[1]):
+                print_info(f"  {manager}: paquetes huérfanos encontrados")
+        return
+    
+    if not confirm_action("¿Eliminar paquetes huérfanos?"):
+        print_info("Operación cancelada")
+        return
+    
+    for manager, cmd in orphan_commands.items():
+        if shutil.which(cmd.split()[0] if not cmd.startswith('sudo') else cmd.split()[1]):
+            try:
+                stdout, stderr, code = run_command(cmd)
+                if code == 0:
+                    print_success(f"{manager}: paquetes huérfanos eliminados")
+                else:
+                    if "no" in stderr.lower() or "nothing" in stderr.lower():
+                        print_info(f"{manager}: no hay paquetes huérfanos")
+                    else:
+                        print_warning(f"{manager}: error parcial - {stderr}")
+            except Exception as e:
+                print_warning(f"{manager}: error - {e}")
+
+def clean_logs_advanced():
+    """Limpia logs antiguos del sistema de forma más inteligente."""
+    print_header("📋 LIMPIANDO LOGS ANTIGUOS", Fore.CYAN)
     
     log_dirs = []
+    days_old = 30  # Configurable
+    
     if SISTEMA == "Linux":
-        log_dirs = ['/var/log']
+        log_dirs = ['/var/log', os.path.join(HOME, '.cache')]
     elif SISTEMA == "Windows":
         log_dirs = ['C:\\Windows\\Logs']
+    
+    total_freed = 0
+    files_deleted = 0
+    cutoff_time = time.time() - (days_old * 24 * 3600)
     
     for log_dir in log_dirs:
         if not os.path.exists(log_dir):
             continue
+        
         try:
             for root, dirs, files in os.walk(log_dir):
                 for file in files:
-                    if file.endswith(('.log', '.old', '.1', '.2', '.3', '.gz')):
+                    if file.endswith(('.log', '.old', '.gz', '.bz2', '.xz', '.1', '.2', '.3', '.4', '.5')):
                         file_path = os.path.join(root, file)
                         try:
-                            if os.path.getmtime(file_path) < time.time() - 30 * 24 * 3600:  # 30 días
+                            if os.path.getmtime(file_path) < cutoff_time:
                                 size = get_size(file_path)
+                                total_freed += size
+                                files_deleted += 1
+                                
                                 if not CONFIG["dry_run"]:
-                                    os.remove(file_path)
-                                ESPACIO_LIBERADO += size
-                                ARCHIVOS_ELIMINADOS += 1
-                        except:
+                                    if backup_file(file_path):
+                                        os.remove(file_path)
+                        except (PermissionError, OSError):
                             pass
+        except Exception:
+            pass
+    
+    if CONFIG["dry_run"]:
+        print_success(f"Se limpiarían {files_deleted} logs ({format_size(total_freed)})")
+    else:
+        print_success(f"Eliminados {files_deleted} logs antiguos ({format_size(total_freed)})")
+        STATS["files_deleted"] += files_deleted
+        STATS["space_freed"] += total_freed
+
+def clean_docker_advanced():
+    """Limpia recursos de Docker no utilizados."""
+    print_header("🐳 LIMPIANDO DOCKER", Fore.CYAN)
+    
+    if not shutil.which("docker"):
+        print_info("Docker no instalado")
+        return
+    
+    if CONFIG["dry_run"]:
+        print_info("[DRY-RUN] Se limpiarían recursos Docker")
+        # Mostrar recursos actuales
+        stdout, _, _ = run_command("docker system df")
+        print_info("Uso actual de Docker:")
+        for line in stdout.split('\n'):
+            print(f"  {line}")
+        return
+    
+    if not confirm_action("¿Limpiar todos los recursos Docker no utilizados?"):
+        print_info("Operación cancelada")
+        return
+    
+    commands = [
+        ("Contenedores detenidos", "docker container prune -f"),
+        ("Imágenes no utilizadas", "docker image prune -af"),
+        ("Volúmenes no utilizados", "docker volume prune -f"),
+        ("Redes no utilizadas", "docker network prune -f"),
+        ("Todos los recursos", "docker system prune -af --volumes")
+    ]
+    
+    for desc, cmd in commands:
+        stdout, stderr, code = run_command(cmd)
+        if code == 0:
+            print_success(f"{desc} limpiado")
+        else:
+            print_warning(f"Error limpiando {desc}")
+
+def clean_recycle_bin():
+    """Vacía la papelera de reciclaje."""
+    print_header("🗑️ VACIANDO PAPELERA", Fore.CYAN)
+    
+    if CONFIG["dry_run"]:
+        if SISTEMA == "Windows":
+            print_info("[DRY-RUN] Se vaciaría la papelera de reciclaje")
+        else:
+            print_info("[DRY-RUN] Se vaciaría la papelera (Trash)")
+        return
+    
+    if not confirm_action("¿Vaciar papelera de reciclaje?"):
+        print_info("Operación cancelada")
+        return
+    
+    if SISTEMA == "Windows":
+        stdout, stderr, code = run_command("powershell -command Clear-RecycleBin -Force")
+        if code == 0:
+            print_success("Papelera de reciclaje vaciada")
+        else:
+            print_warning("Error vaciando papelera")
+    else:
+        # Linux trash
+        trash_dirs = [
+            os.path.join(HOME, '.local/share/Trash'),
+            os.path.join(HOME, '.trash'),
+            os.path.join(HOME, 'Trash')
+        ]
+        for trash_dir in trash_dirs:
+            if os.path.exists(trash_dir):
+                try:
+                    shutil.rmtree(trash_dir, ignore_errors=True)
+                    Path(trash_dir).mkdir(exist_ok=True)
+                    print_success(f"Papelera vaciada: {trash_dir}")
+                except Exception:
+                    pass
+
+def clean_cache_extras():
+    """Limpia cachés adicionales y archivos de sistema."""
+    print_header("🧽 LIMPIANDO CACHÉS ADICIONALES", Fore.CYAN)
+    
+    # Eliminar archivos core dump
+    if SISTEMA == "Linux":
+        core_patterns = ['core', 'core.*', '*.core']
+        for pattern in core_patterns:
+            for core_file in glob.glob(os.path.join('/', '**', pattern), recursive=True):
+                try:
+                    if os.path.isfile(core_file) and os.path.getsize(core_file) > 0:
+                        size = get_size(core_file)
+                        if not CONFIG["dry_run"]:
+                            os.remove(core_file)
+                            print_success(f"Core dump eliminado: {Path(core_file).name} ({format_size(size)})")
+                            STATS["space_freed"] += size
+                except (PermissionError, OSError):
+                    pass
+    
+    # Limpiar miniaturas
+    thumbnails_dir = os.path.join(HOME, '.cache/thumbnails') if SISTEMA == "Linux" else os.path.join(HOME, 'AppData/Local/Microsoft/Windows/Explorer')
+    if os.path.exists(thumbnails_dir):
+        size = get_size(thumbnails_dir)
+        if size > 0:
+            if not CONFIG["dry_run"]:
+                shutil.rmtree(thumbnails_dir, ignore_errors=True)
+                print_success(f"Caché de miniaturas limpiado ({format_size(size)})")
+                STATS["space_freed"] += size
+            else:
+                print_info(f"[DRY-RUN] Miniaturas: {format_size(size)} a limpiar")
+    
+    # Limpiar .DS_Store (macOS/Linux)
+    for ds_file in glob.glob(os.path.join(HOME, '**/.DS_Store'), recursive=True):
+        try:
+            if os.path.isfile(ds_file):
+                size = get_size(ds_file)
+                if not CONFIG["dry_run"]:
+                    os.remove(ds_file)
+                    STATS["space_freed"] += size
+                    if CONFIG["verbose"]:
+                        print_success(f"Eliminado: {ds_file}")
         except:
             pass
 
-def clean_docker():
-    """Limpia caché de Docker."""
-    print_colored("\n🐳 Limpiando Docker...", Fore.CYAN, Style.BRIGHT)
-    
-    if shutil.which("docker"):
-        if CONFIG["dry_run"]:
-            print_colored("  [DRY-RUN] Docker será limpiado", Fore.YELLOW)
-            return
-        cmds = [
-            "docker system prune -af",
-            "docker volume prune -f",
-            "docker image prune -af"
-        ]
-        for cmd in cmds:
-            stdout, stderr, code = run_command(cmd)
-            if code == 0:
-                print_colored(f"  ✅ {cmd.split()[1]} limpiado", Fore.GREEN)
-            else:
-                print_colored(f"  ⚠️ Error en {cmd.split()[1]}", Fore.YELLOW)
-    else:
-        print_colored("  ℹ️ Docker no instalado", Fore.BLUE)
-
-# ==================== FUNCIONES DE REPORTE ====================
-def get_system_info():
-    """Obtiene información del sistema."""
+# ==================== SISTEMA DE REPORTES ====================
+def get_system_info_advanced() -> Dict:
+    """Obtiene información detallada del sistema."""
     info = {
         "Sistema": SISTEMA,
         "Hostname": platform.node(),
-        "Procesador": platform.processor(),
+        "Usuario": USUARIO,
         "Arquitectura": platform.machine(),
-        "Python": platform.python_version()
+        "Procesador": platform.processor(),
+        "Python": platform.python_version(),
+        "Fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     
     try:
         mem = psutil.virtual_memory()
         info["Memoria Total"] = format_size(mem.total)
         info["Memoria Usada"] = format_size(mem.used)
-        info["Memoria Disponible"] = format_size(mem.available)
+        info["Memoria Libre"] = format_size(mem.available)
+        info["Memoria Uso"] = f"{mem.percent:.1f}%"
         
         if SISTEMA == "Linux":
             swap = psutil.swap_memory()
-            info["Swap Total"] = format_size(swap.total)
-            info["Swap Usado"] = format_size(swap.used)
+            if swap.total > 0:
+                info["Swap Total"] = format_size(swap.total)
+                info["Swap Usado"] = format_size(swap.used)
+                info["Swap Uso"] = f"{swap.percent:.1f}%"
         
         disk = psutil.disk_usage('/' if SISTEMA == "Linux" else 'C:')
         info["Disco Total"] = format_size(disk.total)
         info["Disco Usado"] = format_size(disk.used)
         info["Disco Libre"] = format_size(disk.free)
-    except:
-        pass
+        info["Disco Uso"] = f"{disk.percent:.1f}%"
+        
+        # CPU
+        info["CPU Cores"] = psutil.cpu_count()
+        info["CPU Uso"] = f"{psutil.cpu_percent(interval=1):.1f}%"
+        
+        # Procesos
+        info["Procesos"] = len(psutil.pids())
+        
+    except Exception as e:
+        if CONFIG["verbose"]:
+            print_warning(f"Error obteniendo información del sistema: {e}")
     
     return info
 
-def print_report(initial_info, final_info=None):
-    """Imprime un reporte detallado."""
-    print_colored("\n" + "="*60, Fore.MAGENTA, Style.BRIGHT)
-    print_colored("📊 REPORTE DE LIMPIEZA SNEK-PURGE", Fore.MAGENTA, Style.BRIGHT)
-    print_colored("="*60, Fore.MAGENTA, Style.BRIGHT)
+def print_advanced_report(initial_info: Dict, final_info: Dict):
+    """Imprime un reporte detallado y bonito."""
+    print("\n" + Fore.MAGENTA + Style.BRIGHT + "=" * 70)
+    print(f"{'🐍 SNEK-PURGE - REPORTE FINAL'.center(70)}")
+    print("=" * 70 + Style.RESET_ALL)
     
-    print_colored(f"\n🗑️  Archivos eliminados: {ARCHIVOS_ELIMINADOS}", Fore.CYAN)
-    print_colored(f"💾 Espacio liberado: {format_size(ESPACIO_LIBERADO)}", Fore.GREEN, Style.BRIGHT)
+    # Estadísticas
+    print(f"\n{Fore.CYAN}📊 ESTADÍSTICAS DE LIMPIEZA{Style.RESET_ALL}")
+    print(f"  Archivos eliminados: {Fore.GREEN}{STATS['files_deleted']:,}{Style.RESET_ALL}")
+    print(f"  Espacio liberado: {Fore.GREEN}{format_size(STATS['space_freed'])}{Style.RESET_ALL}")
+    print(f"  Tiempo total: {Fore.CYAN}{(STATS['end_time'] - STATS['start_time']):.2f}s{Style.RESET_ALL}")
     
-    if final_info:
-        print_colored("\n📈 Estado del sistema:", Fore.YELLOW)
-        print_colored(f"  Memoria: {final_info.get('Memoria Usada', 'N/A')} usado / {final_info.get('Memoria Total', 'N/A')} total", Fore.WHITE)
-        if SISTEMA == "Linux":
-            print_colored(f"  Swap: {final_info.get('Swap Usado', 'N/A')} usado / {final_info.get('Swap Total', 'N/A')} total", Fore.WHITE)
-        print_colored(f"  Disco: {final_info.get('Disco Usado', 'N/A')} usado / {final_info.get('Disco Total', 'N/A')} total ({final_info.get('Disco Libre', 'N/A')} libre)", Fore.WHITE)
+    if STATS['errors'] > 0:
+        print(f"  Errores: {Fore.RED}{STATS['errors']}{Style.RESET_ALL}")
+    if STATS['warnings'] > 0:
+        print(f"  Advertencias: {Fore.YELLOW}{STATS['warnings']}{Style.RESET_ALL}")
     
+    # Comparativa de memoria
+    print(f"\n{Fore.CYAN}📈 COMPARATIVA DEL SISTEMA{Style.RESET_ALL}")
+    
+    mem_initial = initial_info.get("Memoria Usada", "0 B")
+    mem_final = final_info.get("Memoria Usada", "0 B")
+    mem_freed = initial_info.get("Memoria Total", "0 B")  # Placeholder
+    
+    print(f"  Memoria: {Fore.YELLOW}{mem_initial}{Style.RESET_ALL} → {Fore.GREEN}{mem_final}{Style.RESET_ALL}")
+    
+    if SISTEMA == "Linux" and "Swap Usado" in initial_info:
+        swap_initial = initial_info.get("Swap Usado", "0 B")
+        swap_final = final_info.get("Swap Usado", "0 B")
+        print(f"  Swap: {Fore.YELLOW}{swap_initial}{Style.RESET_ALL} → {Fore.GREEN}{swap_final}{Style.RESET_ALL}")
+    
+    disk_initial = initial_info.get("Disco Libre", "0 B")
+    disk_final = final_info.get("Disco Libre", "0 B")
+    print(f"  Disco libre: {Fore.YELLOW}{disk_initial}{Style.RESET_ALL} → {Fore.GREEN}{disk_final}{Style.RESET_ALL}")
+    
+    # Detalles adicionales
     if CONFIG["dry_run"]:
-        print_colored("\n⚠️  MODO DRY-RUN: No se realizaron cambios reales", Fore.YELLOW, Style.BRIGHT)
+        print(f"\n{Fore.YELLOW}⚠️  EJECUTADO EN MODO DRY-RUN - No se realizaron cambios reales{Style.RESET_ALL}")
+    elif CONFIG["scheduled"]:
+        print(f"\n{Fore.BLUE}🤖 EJECUTADO EN MODO PROGRAMADO - Sin interacción{Style.RESET_ALL}")
     
-    print_colored("\n✨ Limpieza completada con éxito", Fore.GREEN, Style.BRIGHT)
-    print_colored("="*60 + "\n", Fore.MAGENTA)
+    # Sistema
+    print(f"\n{Fore.CYAN}🖥️  INFORMACIÓN DEL SISTEMA{Style.RESET_ALL}")
+    print(f"  Sistema: {Fore.WHITE}{final_info.get('Sistema', 'N/A')}{Style.RESET_ALL}")
+    print(f"  Host: {Fore.WHITE}{final_info.get('Hostname', 'N/A')}{Style.RESET_ALL}")
+    print(f"  Usuario: {Fore.WHITE}{final_info.get('Usuario', 'N/A')}{Style.RESET_ALL}")
+    print(f"  CPU: {Fore.WHITE}{final_info.get('CPU Uso', 'N/A')} ({final_info.get('CPU Cores', 'N/A')} cores){Style.RESET_ALL}")
+    
+    print(f"\n{Fore.GREEN}{'✨ LIMPIEZA COMPLETADA CON ÉXITO ✨'.center(70)}{Style.RESET_ALL}")
+    print(Fore.MAGENTA + "=" * 70 + Style.RESET_ALL + "\n")
 
 # ==================== FUNCIÓN PRINCIPAL ====================
 def main():
     parser = argparse.ArgumentParser(
-        description="Snek-Purge - Limpia tu sistema como un profesional",
+        description="🐍 Snek-Purge - Limpieza profesional para Windows y Linux",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Ejemplos:
-  snek-purge --quick          # Limpieza rápida
-  snek-purge --full           # Limpieza completa
-  snek-purge --dry-run        # Ver qué se eliminará
-  snek-purge --browsers       # Limpiar solo navegadores
-  snek-purge --scheduled      # Modo programado (sin interacción)
+Ejemplos de uso:
+  %(prog)s --quick              # Limpieza rápida (temp, caché, memoria)
+  %(prog)s --full               # Limpieza completa (todas las opciones)
+  %(prog)s --dry-run            # Ver qué se eliminará sin hacer cambios
+  %(prog)s --browsers           # Limpiar solo navegadores
+  %(prog)s --scheduled          # Modo programado (sin interacción)
+  %(prog)s --config config.json # Usar archivo de configuración
+  
+  %(prog)s --help               # Mostrar esta ayuda
         """
     )
     
     parser.add_argument('--dry-run', action='store_true', help='Simular limpieza sin eliminar')
-    parser.add_argument('--quick', action='store_true', help='Modo rápido (solo lo esencial)')
+    parser.add_argument('--quick', action='store_true', help='Modo rápido (temp, caché, memoria)')
     parser.add_argument('--full', action='store_true', help='Limpieza completa')
     parser.add_argument('--browsers', action='store_true', help='Limpiar caché de navegadores')
-    parser.add_argument('--memory', action='store_true', help='Liberar memoria (RAM y swap)')
+    parser.add_argument('--memory', action='store_true', help='Optimizar memoria (RAM y swap)')
     parser.add_argument('--logs', action='store_true', help='Limpiar logs antiguos')
     parser.add_argument('--orphans', action='store_true', help='Eliminar paquetes huérfanos (Linux)')
     parser.add_argument('--docker', action='store_true', help='Limpiar Docker')
+    parser.add_argument('--recycle', action='store_true', help='Vaciar papelera de reciclaje')
     parser.add_argument('--scheduled', action='store_true', help='Modo programado (sin confirmación)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Salida detallada')
+    parser.add_argument('--no-backup', action='store_true', help='Desactivar backups')
     parser.add_argument('--config', help='Archivo de configuración JSON')
+    parser.add_argument('--version', action='version', version='Snek-Purge v2.0')
     
     args = parser.parse_args()
     
     # Actualizar configuración
     CONFIG.update(vars(args))
+    CONFIG["backup"] = not args.no_backup
     
     # Cargar configuración desde archivo
     if args.config and os.path.exists(args.config):
         try:
-            with open(args.config, 'r') as f:
+            with open(args.config, 'r', encoding='utf-8') as f:
                 user_config = json.load(f)
                 CONFIG.update(user_config)
-        except:
-            print_colored("⚠️ Error cargando archivo de configuración", Fore.YELLOW)
+                print_success(f"Configuración cargada desde {args.config}")
+        except Exception as e:
+            print_warning(f"No se pudo cargar configuración: {e}")
+    
+    # Iniciar
+    STATS["start_time"] = time.time()
     
     # Mostrar banner
-    print_colored("""
-    🐍 SNEK-PURGE v1.0
-    Limpieza profesional para Windows y Linux
-    """, Fore.GREEN, Style.BRIGHT)
+    print(f"""
+{Fore.GREEN}{Style.BRIGHT}
+╔══════════════════════════════════════════════════════════════════╗
+║  🐍 SNEK-PURGE v2.0                                            ║
+║  Limpieza profesional para Windows y Linux                      ║
+║  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}                              ║
+╚══════════════════════════════════════════════════════════════════╝
+{Style.RESET_ALL}""")
     
-    # Información inicial del sistema
-    initial_info = get_system_info()
-    print_colored("\n📋 Información del sistema:", Fore.CYAN)
+    # Información inicial
+    initial_info = get_system_info_advanced()
+    print(f"\n{Fore.CYAN}📋 INFORMACIÓN DEL SISTEMA{Style.RESET_ALL}")
     for key, value in initial_info.items():
-        print_colored(f"  {key}: {value}", Fore.WHITE)
+        if key not in ['Fecha']:
+            print(f"  {key}: {Fore.WHITE}{value}{Style.RESET_ALL}")
     
+    # Modos de ejecución
     if CONFIG["dry_run"]:
-        print_colored("\n⚠️  MODO DRY-RUN: Solo se mostrará lo que se eliminará", Fore.YELLOW, Style.BRIGHT)
+        print(f"\n{Fore.YELLOW}⚠️  MODO DRY-RUN ACTIVADO - Solo se mostrará lo que se eliminará{Style.RESET_ALL}")
     
     if not CONFIG["scheduled"] and not CONFIG["dry_run"]:
-        if not confirm_action("¿Deseas continuar con la limpieza?"):
-            print_colored("Operación cancelada.", Fore.YELLOW)
+        if not confirm_action("¿Deseas continuar con la limpieza?", default=True):
+            print_warning("Operación cancelada")
             return
     
-    # Ejecutar limpieza
-    start_time = time.time()
+    # Ejecutar limpieza según modo
+    print(f"\n{Fore.CYAN}🚀 INICIANDO LIMPIEZA...{Style.RESET_ALL}")
     
     if CONFIG["quick"]:
         clean_temp_files()
-        clean_cache()
-        clean_memory()
+        clean_system_cache()
+        clean_memory_advanced()
+        clean_recycle_bin()
+    
     elif CONFIG["full"]:
         clean_temp_files()
-        clean_cache()
-        clean_memory()
-        clean_browsers()
-        clean_logs()
-        clean_orphans()
-        clean_docker()
+        clean_system_cache()
+        clean_memory_advanced()
+        clean_browsers_advanced()
+        clean_logs_advanced()
+        clean_orphans_advanced()
+        clean_docker_advanced()
+        clean_recycle_bin()
+        clean_cache_extras()
+    
     else:
-        # Modo normal: limpiar todo menos logs y orphans
+        # Modo personalizado
         clean_temp_files()
-        clean_cache()
-        clean_memory()
-        if CONFIG["browsers"] or CONFIG["full"]:
-            clean_browsers()
-        if CONFIG["logs"] or CONFIG["full"]:
-            clean_logs()
-        if CONFIG["orphans"] or CONFIG["full"]:
-            clean_orphans()
-        if CONFIG["docker"] or CONFIG["full"]:
-            clean_docker()
+        clean_system_cache()
+        clean_memory_advanced()
+        
+        if CONFIG["browsers"]:
+            clean_browsers_advanced()
+        if CONFIG["logs"]:
+            clean_logs_advanced()
+        if CONFIG["orphans"]:
+            clean_orphans_advanced()
+        if CONFIG["docker"]:
+            clean_docker_advanced()
+        if CONFIG["recycle"]:
+            clean_recycle_bin()
     
     # Reporte final
-    final_info = get_system_info()
-    elapsed_time = time.time() - start_time
+    STATS["end_time"] = time.time()
+    final_info = get_system_info_advanced()
+    print_advanced_report(initial_info, final_info)
     
-    print_report(initial_info, final_info)
-    print_colored(f"⏱️  Tiempo de ejecución: {elapsed_time:.2f} segundos", Fore.CYAN)
+    # Crear archivo de log si se solicita
+    if CONFIG["verbose"]:
+        log_file = Path(HOME) / ".snek-purge.log"
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"Limpieza completada: {datetime.now().isoformat()}\n")
+            f.write(f"Archivos eliminados: {STATS['files_deleted']}\n")
+            f.write(f"Espacio liberado: {format_size(STATS['space_freed'])}\n")
+            f.write(f"Tiempo: {(STATS['end_time'] - STATS['start_time']):.2f}s\n")
+        print_info(f"Log guardado en: {log_file}")
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print_colored("\n\n⚠️  Operación cancelada por el usuario", Fore.YELLOW)
+        print(f"\n\n{Fore.YELLOW}⚠️  Operación cancelada por el usuario{Style.RESET_ALL}")
         sys.exit(0)
     except Exception as e:
-        print_colored(f"\n❌ Error inesperado: {e}", Fore.RED)
-        if CONFIG["verbose"]:
+        print(f"\n{Fore.RED}❌ Error inesperado: {e}{Style.RESET_ALL}")
+        if CONFIG.get("verbose", False):
             import traceback
             traceback.print_exc()
         sys.exit(1)
