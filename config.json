@@ -1,0 +1,29 @@
+{
+  "dry_run": false,
+  "verbose": false,
+  "scheduled": false,
+  "quick": false,
+  "full": false,
+  "browsers": true,
+  "memory": true,
+  "logs": true,
+  "orphans": true,
+  "docker": true,
+  "safe_mode": true,
+  "backup": true,
+  "parallel": true,
+  "max_workers": 4,
+  "days_old_logs": 30,
+  "exclude_dirs": [
+    "~/.local/share/Trash",
+    "/proc",
+    "/sys"
+  ],
+  "browsers_to_clean": [
+    "Chrome",
+    "Firefox",
+    "Edge",
+    "Opera",
+    "Brave"
+  ]
+}
